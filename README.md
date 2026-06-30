@@ -157,7 +157,7 @@ Key environment variables (`.env` file):
 ## 📈 Workflow (Fully Automated Closed Loop)
 
 ```mermaid
-graph LR
+
     A[Scan Web for Needs] --> B[Vector Dedup]
     B --> C[Assemble AI Team]
     C --> D[Generate Funding Proposal]
