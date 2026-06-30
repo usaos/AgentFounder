@@ -1,0 +1,1044 @@
+import os
+import shutil
+PROJECT_NAME = "AgentFounder"
+FILE_LIST = [
+    ("LICENSE", """\
+                    GNU AFFERO GENERAL PUBLIC LICENSE
+                       Version 3, 19 November 2007
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+                            PREAMBLE
+  The GNU Affero General Public License is a free, copyleft license for
+software and other kinds of works, specifically designed to ensure
+cooperation with the community in the case of network server software.
+  The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works.  By contrast,
+our General Public Licenses are intended to guarantee your freedom to
+share and change all versions of a program--to make sure it remains free
+software for all its users.
+"""),
+    ("docker-compose.yml", """\
+services:
+  api:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+  # 注释掉 Ollama 服务，使用您本地的 Ollama
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_storage:/root/.ollama
+  #   restart: unless-stopped
+  #   command: >
+  #     sh -c "
+  #     ollama serve &
+  #     OLLAMA_PID=$$!
+  #     while ! wget --quiet --tries=1 --spider http://127.0.0.1:11434/api/tags; do
+  #       echo Waiting for Ollama service...
+  #       sleep 2
+  #     done
+  #     echo Ollama ready, pulling llama3.1:8b
+  #     ollama pull llama3.1:8b
+  #     wait $$OLLAMA_PID
+  #     "
+  #   healthcheck:
+  #     test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:11434/api/tags"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+# volumes:
+#   ollama_storage:
+"""),
+    ("Dockerfile", """\
+FROM python:3.11-slim
+WORKDIR /app
+RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends curl wget && \
+    rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /app/data/logs /app/data/vault && chmod 777 /app/data
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+COPY . .
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://127.0.0.1:8000/health || exit 1
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+"""),
+    ("requirements.txt", """\
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-dotenv==1.0.1
+tavily-python==0.5.0
+httpx==0.28.1
+sentence-transformers==3.3.1
+aiosqlite==0.20.0
+gradio==5.9.1
+cryptography==43.0.1
+apscheduler==3.10.4
+numpy==1.26.4
+"""),
+    (".env.example", """\
+# Global Auth Token (Change this!)
+API_GLOBAL_TOKEN=change_me_in_production
+# LLM Keys
+ANTHROPIC_API_KEY=
+DEEPSEEK_API_KEY=
+X_GROK_API_KEY=
+DASHSCOPE_API_KEY=
+# Ollama Config (关键：指向宿主机地址)
+OLLAMA_HOST=http://host.docker.internal:11434
+# System Config
+SCAN_INTERVAL_MIN=30
+AUTO_CYCLE_ENABLE=true
+LOG_LEVEL=INFO
+DAILY_TOKEN_LIMIT=100000
+# Vercel Deployment (Optional)
+VERCEL_TOKEN=
+"""),
+    # App Files
+    ("app/__init__.py", ""),
+    ("app/main.py", """\
+import os
+import asyncio
+import shutil
+import httpx
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from app.api.routes import router
+from app.api.middleware import LimitMiddleware
+from app.api.auth_global import GlobalAuthMiddleware
+from app.utils.db import init_db, close_db, get_conn, archive_old_data
+from app.scheduler import auto_engine
+from app.utils.crypto import decrypt_env
+from app.utils.logger import logger
+from app.agents.mesh_bus import mesh
+from app.agents.health_monitor import start_health_monitor
+from app.core.factory import factory
+from app.utils.token_monitor import token_monitor
+from dashboard.app import mount_dashboard
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("AgentFounder V5.0 (AGPL-3.0) 启动中...")
+    await init_db()
+    
+    env = decrypt_env()
+    
+    # 启动 WebSocket 消息总线
+    await mesh.start()
+    
+    # 启动心跳监测
+    asyncio.create_task(start_health_monitor())
+    
+    # 启动工厂清理
+    await factory.start_cleaner()
+    
+    # 环境变量类型安全
+    cycle_enable_val = env.get("AUTO_CYCLE_ENABLE", "true")
+    if isinstance(cycle_enable_val, bool):
+        cycle_enable = cycle_enable_val
+    else:
+        cycle_enable = str(cycle_enable_val).strip().lower() == "true"
+    
+    if cycle_enable:
+        try:
+            interval = int(env.get("SCAN_INTERVAL_MIN", "30"))
+        except (ValueError, TypeError):
+            interval = 30
+        await auto_engine.start(interval)
+    # 启动月度归档任务
+    auto_engine.sched.add_job(archive_old_data, 'cron', day=1, hour=2)
+    # 启动每日 Token 重置
+    auto_engine.sched.add_job(token_monitor.reset_daily, 'cron', hour=0)
+    
+    yield
+    
+    logger.info("正在关闭服务...")
+    await auto_engine.shutdown()
+    await mesh.shutdown()
+    await close_db()
+    logger.info("服务已安全关闭")
+app = FastAPI(title="AgentFounder", version="5.0.0-AGPL", lifespan=lifespan)
+# 中间件顺序：鉴权 -> 限流
+app.add_middleware(GlobalAuthMiddleware)
+app.add_middleware(LimitMiddleware, req_per_min=120)
+app.include_router(router)
+mount_dashboard(app)
+@app.get("/")
+async def root():
+    return {"name":"AgentFounder", "license":"AGPL-3.0", "docs":"/docs", "dashboard":"/dashboard"}
+@app.get("/health")
+async def health():
+    checks = {}
+    status_code = 200
+    try:
+        conn = await get_conn()
+        await conn.execute("SELECT 1")
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {str(e)}"
+        status_code = 503
+    try:
+        ollama_host = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+        async with httpx.AsyncClient(timeout=2) as client:
+            resp = await client.get(f"{ollama_host}/api/tags")
+            checks["ollama"] = "ok" if resp.status_code == 200 else "unreachable"
+    except Exception:
+        checks["ollama"] = "unreachable"
+    try:
+        _, _, free = shutil.disk_usage("/app/data")
+        checks["disk_free_gb"] = round(free / (1024**3), 2)
+    except Exception:
+        checks["disk"] = "error"
+    overall = "healthy" if "error" not in str(checks.values()) and checks.get("ollama") == "ok" else "degraded"
+    return {"status": overall, "checks": checks}
+"""),
+    ("app/api/auth_global.py", """\
+from fastapi import Request, HTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+from app.utils.crypto import decrypt_env
+class GlobalAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app):
+        super().__init__(app)
+        env = decrypt_env()
+        self.global_token = env.get("API_GLOBAL_TOKEN", "AF_DEFAULT_2026")
+        self.whitelist = ["/", "/health", "/dashboard", "/docs", "/openapi.json", "/favicon.ico"]
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if any(path == w or path.startswith(w) for w in self.whitelist):
+            return await call_next(request)
+        
+        token_header = request.headers.get("X-Access-Token", "")
+        if token_header != self.global_token:
+            raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid API Global Token")
+        
+        return await call_next(request)
+"""),
+    ("app/api/middleware.py", """\
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+import time
+class LimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, req_per_min=60):
+        super().__init__(app)
+        self.rate = req_per_min
+        self.ip_map = {}
+        self.last_cleanup = time.time()
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in ["/health", "/"]:
+            return await call_next(request)
+        now = time.time()
+        if now - self.last_cleanup > 300:
+            self.ip_map.clear()
+            self.last_cleanup = now
+        ip = request.client.host if request.client else "unknown"
+        if ip not in self.ip_map:
+            self.ip_map[ip] = []
+        
+        self.ip_map[ip] = [t for t in self.ip_map[ip] if now - t < 60]
+        if len(self.ip_map[ip]) >= self.rate:
+            return JSONResponse(status_code=429, content={"detail": "Request limit reached"})
+        self.ip_map[ip].append(now)
+        return await call_next(request)
+"""),
+    ("app/api/models.py", """\
+from pydantic import BaseModel, Field
+class RegAgentReq(BaseModel):
+    agent_id: str
+    capabilities: list[str]
+    endpoint: str
+    auth_token: str = ""
+    reputation: float = Field(0.5, ge=0, le=1)
+class BuildTeamReq(BaseModel):
+    opportunity_id: str
+    max_agents: int = Field(3, ge=1, le=10)
+class DeployReq(BaseModel):
+    opportunity_id: str
+    template: str = "telegram_bot"
+class FeedbackReq(BaseModel):
+    product_id: str
+    text: str
+    user_id: str | None = "anon"
+"""),
+    ("app/api/routes.py", """\
+import json
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
+from app.api.models import RegAgentReq, BuildTeamReq, DeployReq, FeedbackReq
+from app.agents.registry import registry
+from app.core.scanner import scanner
+from app.core.team_builder import team_builder
+from app.core.factory import factory
+from app.core.meaning import oracle
+from app.utils.db import list_opps, get_opp, insert_feedback, get_product_metrics
+from app.agents.mesh_bus import mesh
+router = APIRouter(prefix="/api/v1")
+@router.post("/agents/register")
+async def reg_agent(req: RegAgentReq):
+    await registry.register(req.model_dump())
+    return {"msg": "registered"}
+@router.get("/agents")
+async def list_agents():
+    return {"agents": await registry.list_all()}
+@router.get("/opportunities/scan")
+async def scan_opp(q: str = "I wish there was an app"):
+    await scanner.scan_single(q)
+    return {"status": "scanned"}
+@router.get("/opportunities")
+async def get_opps(limit: int = 10):
+    return {"opportunities": await list_opps(limit)}
+@router.post("/team/build")
+async def build_team(req: BuildTeamReq):
+    opp = await get_opp(req.opportunity_id)
+    if not opp:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    team = await team_builder.match_team(opp["suggested_solution_direction"], req.max_agents)
+    return {"team": team}
+@router.post("/product/deploy")
+async def deploy_prod(req: DeployReq):
+    opp = await get_opp(req.opportunity_id)
+    if not opp:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    team = await team_builder.match_team(opp["suggested_solution_direction"])
+    prod = await factory.build_deploy(opp, team, req.template)
+    return prod
+@router.post("/feedback")
+async def add_feedback(req: FeedbackReq):
+    score = await oracle.compute(req.text)
+    await insert_feedback({
+        "product_id": req.product_id, 
+        "user_id": req.user_id, 
+        "text": req.text, 
+        "relief_score": score
+    })
+    return {"relief_score": score}
+@router.get("/products/{pid}/metrics")
+async def metrics(pid: str):
+    return await get_product_metrics(pid)
+@router.websocket("/ws/{agent_id}")
+async def ws_stream(ws: WebSocket, agent_id: str):
+    await ws.accept()
+    await mesh.register_ws(agent_id, ws)
+    try:
+        while True:
+            raw = await ws.receive_text()
+            await ws.send_text(json.dumps({"ack": raw}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        pass
+    finally:
+        await mesh.unregister(agent_id)
+"""),
+    # Utils
+    ("app/utils/db.py", """\
+import asyncio
+import aiosqlite
+import json
+import time
+from pathlib import Path
+DB_PATH = "./data/agent.db"
+_db_conn: aiosqlite.Connection = None
+_db_lock = asyncio.Lock()
+async def init_db():
+    global _db_conn
+    async with _db_lock:
+        if _db_conn is None:
+            Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+            _db_conn = await aiosqlite.connect(DB_PATH)
+            await _db_conn.execute("PRAGMA journal_mode=WAL;")
+            _db_conn.row_factory = aiosqlite.Row
+            
+            # Creating tables (修复语法错误)
+            await _db_conn.execute("CREATE TABLE IF NOT EXISTS opportunities(id TEXT PRIMARY KEY, demographic TEXT, pain TEXT, solution_dir TEXT, intensity REAL, sources TEXT, ts REAL, status TEXT DEFAULT 'scanned')")
+            await _db_conn.execute("CREATE TABLE IF NOT EXISTS agents(agent_id TEXT PRIMARY KEY, capabilities TEXT, endpoint TEXT, auth_token TEXT, reputation REAL, health TEXT, last_ping REAL)")
+            await _db_conn.execute("CREATE TABLE IF NOT EXISTS products(pid TEXT PRIMARY KEY, opp_id TEXT, team TEXT, deploy_url TEXT, template TEXT, avg_relief REAL, feedback_count INTEGER DEFAULT 0, ts REAL)")
+            await _db_conn.execute("CREATE TABLE IF NOT EXISTS feedbacks(id INTEGER PRIMARY KEY AUTOINCREMENT, pid TEXT, user_id TEXT, content TEXT, relief REAL, ts REAL)")
+            await _db_conn.execute("CREATE TABLE IF NOT EXISTS token_records(id INTEGER PRIMARY KEY, total_tokens INT, ts REAL)")
+            await _db_conn.execute("CREATE TABLE IF NOT EXISTS ws_tasks(id INTEGER PRIMARY KEY, tid TEXT, agent_id TEXT, payload TEXT, status TEXT, ts REAL)")
+            await _db_conn.execute("CREATE TABLE IF NOT EXISTS opp_archive(id TEXT, demographic TEXT, pain TEXT, ts REAL)")
+            await _db_conn.commit()
+async def close_db():
+    global _db_conn
+    if _db_conn:
+        await _db_conn.close()
+        _db_conn = None
+async def get_conn():
+    if _db_conn is None:
+        await init_db()
+    return _db_conn
+async def archive_old_data():
+    conn = await get_conn()
+    thirty_days_ago = time.time() - (30 * 86400)
+    await conn.execute("INSERT INTO opp_archive SELECT id, demographic, pain, ts FROM opportunities WHERE ts < ?", (thirty_days_ago,))
+    await conn.execute("DELETE FROM opportunities WHERE ts < ?", (thirty_days_ago,))
+    await conn.commit()
+async def insert_token_record(total: int):
+    conn = await get_conn()
+    await conn.execute("INSERT INTO token_records(total_tokens, ts) VALUES (?,?)", (total, time.time()))
+    await conn.commit()
+async def insert_ws_task(tid: str, aid: str, payload: dict):
+    conn = await get_conn()
+    await conn.execute("INSERT INTO ws_tasks(tid, agent_id, payload, status, ts) VALUES (?,?,?,?,?)", 
+                       (tid, aid, json.dumps(payload), "pending", time.time()))
+    await conn.commit()
+async def insert_opp(data: dict):
+    conn = await get_conn()
+    await conn.execute("INSERT INTO opportunities VALUES (?,?,?,?,?,?,?,?)", (
+        data["id"], data["demographic"], data["pain"], 
+        data.get("suggested_solution_direction", ""), data["intensity_score"], 
+        json.dumps(data.get("sources", [])), time.time(), "scanned"
+    ))
+    await conn.commit()
+async def list_opps(limit=10):
+    conn = await get_conn()
+    cursor = await conn.execute("SELECT * FROM opportunities ORDER BY intensity DESC LIMIT ?", (limit,))
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+async def get_pending_opps(limit=3):
+    conn = await get_conn()
+    cursor = await conn.execute("SELECT * FROM opportunities WHERE status='scanned' ORDER BY intensity DESC LIMIT ?", (limit,))
+    return [dict(r) for r in await cursor.fetchall()]
+async def update_opp_status(oid: str, status: str):
+    conn = await get_conn()
+    await conn.execute("UPDATE opportunities SET status=? WHERE id=?", (status, oid))
+    await conn.commit()
+async def get_opp(oid: str):
+    conn = await get_conn()
+    cursor = await conn.execute("SELECT * FROM opportunities WHERE id=?", (oid,))
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+async def upsert_agent(agent: dict):
+    conn = await get_conn()
+    await conn.execute("INSERT OR REPLACE INTO agents VALUES (?,?,?,?,?,?,?)", (
+        agent["agent_id"], json.dumps(agent["capabilities"]), agent["endpoint"], 
+        agent["auth_token"], agent["reputation"], agent.get("health", "online"), time.time()
+    ))
+    await conn.commit()
+async def get_all_agents():
+    conn = await get_conn()
+    cursor = await conn.execute("SELECT * FROM agents")
+    return [dict(r) for r in await cursor.fetchall()]
+async def update_agent_health(aid: str, health: str):
+    conn = await get_conn()
+    await conn.execute("UPDATE agents SET health=?, last_ping=? WHERE agent_id=?", (health, time.time(), aid))
+    await conn.commit()
+async def insert_product(p: dict):
+    conn = await get_conn()
+    await conn.execute("INSERT INTO products VALUES (?,?,?,?,?,?,?,?)", (
+        p["id"], p["opportunity_id"], json.dumps(p["team"]), 
+        p["url"], p["template"], 0.5, 0, time.time()
+    ))
+    await conn.commit()
+async def insert_feedback(fb: dict):
+    conn = await get_conn()
+    await conn.execute("INSERT INTO feedbacks (pid,user_id,content,relief,ts) VALUES (?,?,?,?,?)", (
+        fb["product_id"], fb["user_id"], fb["text"], fb["relief_score"], time.time()
+    ))
+    await conn.commit()
+async def get_product_metrics(pid: str):
+    conn = await get_conn()
+    cursor = await conn.execute("SELECT relief FROM feedbacks WHERE pid=?", (pid,))
+    rows = await cursor.fetchall()
+    scores = [r["relief"] for r in rows]
+    cnt = len(scores)
+    if cnt == 0: return {"count": 0, "avg_relief": 0.5, "status": "no_feedback"}
+    avg = sum(scores)/cnt
+    status = "healthy" if avg > 0.6 else "optimize"
+    return {"count": cnt, "avg_relief": round(avg,3), "status": status}
+"""),
+    ("app/utils/token_monitor.py", """\
+import time
+import os
+from app.utils.logger import logger
+class TokenMonitor:
+    def __init__(self):
+        self.daily_limit = int(os.getenv("DAILY_TOKEN_LIMIT", "100000"))
+        self.today_used = 0
+        self.cutoff = False
+        self.last_reset_date = time.localtime().tm_mday
+    def add_tokens(self, in_tok: int, out_tok: int):
+        if time.localtime().tm_mday != self.last_reset_date:
+            self.reset_daily()
+        total = in_tok + out_tok
+        self.today_used += total
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            from app.utils.db import insert_token_record
+            loop.create_task(insert_token_record(total))
+        except RuntimeError: pass
+        if self.today_used >= self.daily_limit and not self.cutoff:
+            self.cutoff = True
+            logger.critical(f"Token limit reached: {self.daily_limit}")
+    def is_cutoff(self) -> bool: return self.cutoff
+    def reset_daily(self):
+        self.today_used = 0
+        self.cutoff = False
+        self.last_reset_date = time.localtime().tm_mday
+token_monitor = TokenMonitor()
+"""),
+    ("app/utils/vector_loader.py", """\
+import asyncio
+import gc
+from sentence_transformers import SentenceTransformer
+from app.utils.logger import logger
+_embed_cache = None
+_load_lock = asyncio.Lock()
+async def get_embedding_model():
+    global _embed_cache
+    async with _load_lock:
+        if _embed_cache is None:
+            logger.info("Loading vector model...")
+            _embed_cache = SentenceTransformer("all-MiniLM-L6-v2")
+        return _embed_cache
+async def unload_embedding():
+    global _embed_cache
+    if _embed_cache:
+        del _embed_cache
+        _embed_cache = None
+        gc.collect()
+"""),
+    ("app/utils/logger.py", """\
+import logging
+import sys
+import os
+from pathlib import Path
+def create_logger(name: str):
+    logger = logging.getLogger(name)
+    level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_str, logging.INFO)
+    logger.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    log_dir = Path("./data/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        fh_info = logging.FileHandler(log_dir / "agent.log")
+        fh_info.setFormatter(fmt)
+        fh_info.setLevel(logging.INFO)
+        logger.addHandler(fh_info)
+        fh_err = logging.FileHandler(log_dir / "error.log")
+        fh_err.setFormatter(fmt)
+        fh_err.setLevel(logging.ERROR)
+        logger.addHandler(fh_err)
+    except Exception: pass
+    return logger
+logger = create_logger("AgentFounder")
+"""),
+    ("app/utils/validator.py", """\
+import json
+import ast
+import re
+def safe_json_extract(raw: str) -> dict:
+    patterns = [r'```json\\s*(.*?)\\s*```', r'```\\s*(.*?)\\s*```', r'\\{.*\\}']
+    for pattern in patterns:
+        try:
+            match = re.search(pattern, raw, re.DOTALL)
+            if match:
+                content = match.group(1) if pattern.startswith('```') else match.group(0)
+                return json.loads(content)
+        except: continue
+    return {}
+def check_python_code(code: str) -> bool:
+    try: ast.parse(code); return True
+    except SyntaxError: return False
+"""),
+    ("app/utils/crypto.py", """\
+from cryptography.fernet import Fernet
+import json
+import os
+from pathlib import Path
+VAULT_KEY = Path("./data/vault.key")
+ENC_FILE = Path("./.env.enc")
+_cached_env = None
+def generate_key():
+    VAULT_KEY.parent.mkdir(exist_ok=True)
+    if not VAULT_KEY.exists():
+        VAULT_KEY.write_bytes(Fernet.generate_key())
+def get_cipher() -> Fernet:
+    generate_key()
+    return Fernet(VAULT_KEY.read_bytes())
+def encrypt_env(raw_dict: dict):
+    global _cached_env
+    cipher = get_cipher()
+    data = json.dumps(raw_dict).encode("utf8")
+    ENC_FILE.write_bytes(cipher.encrypt(data))
+    _cached_env = raw_dict
+def decrypt_env() -> dict:
+    global _cached_env
+    if _cached_env is not None: return _cached_env
+    if not ENC_FILE.exists(): return dict(os.environ)
+    try:
+        cipher = get_cipher()
+        raw = cipher.decrypt(ENC_FILE.read_bytes())
+        _cached_env = json.loads(raw.decode("utf8"))
+        return _cached_env
+    except Exception: return dict(os.environ)
+def get_secret(k: str) -> str | None:
+    return decrypt_env().get(k) if k else None
+"""),
+    ("app/utils/compliance.py", """\
+import asyncio
+import time
+class ComplianceGuard:
+    def __init__(self):
+        self.last_scan = 0
+        self.min_interval = 5
+    async def wait_scan_cooldown(self):
+        now = time.time()
+        if now - self.last_scan < self.min_interval:
+            await asyncio.sleep(self.min_interval - (now - self.last_scan))
+        self.last_scan = time.time()
+guard = ComplianceGuard()
+"""),
+    # Core
+    ("app/core/scanner.py", """\
+import uuid
+import asyncio
+import numpy as np
+from app.utils.crypto import get_secret
+from app.utils.db import insert_opp, list_opps
+from app.utils.compliance import guard
+from app.utils.validator import safe_json_extract
+from app.llm.router import llm_router
+from app.utils.logger import logger
+from app.utils.vector_loader import get_embedding_model
+class OpportunityScanner:
+    def __init__(self):
+        self.search_queries = ["I wish there was a tool", "pain points", "missing features"]
+    async def _fetch_texts(self, q: str):
+        try:
+            from tavily import TavilyClient
+            tk = get_secret("TAVILY_API_KEY")
+            if tk:
+                client = TavilyClient(tk)
+                loop = asyncio.get_running_loop()
+                def sync_search(): return client.search(query=q, max_results=6)
+                res = await loop.run_in_executor(None, sync_search)
+                return [r["content"] for r in res["results"] if r.get("content")]
+        except Exception as e: logger.warning(f"Tavily error {e}")
+        return ["Users lack tools", "Software is bloated"]
+    async def scan_single(self, q: str):
+        await guard.wait_scan_cooldown()
+        texts = await self._fetch_texts(q)
+        prompt = f'Analyze demands JSON:{{"demographic":"people","pain":"pain","intensity":0.8,"direction":"solution"}}\\nText:{" ".join(texts)}'
+        result = await llm_router.run("demand_scan", prompt)
+        data = safe_json_extract(result.text)
+        if not data: data = {"demographic":"general","pain":"demand","intensity_score":0.6,"suggested_solution_direction":"AI"}
+        # Deduplication
+        embed = await get_embedding_model()
+        existing = await list_opps(limit=50)
+        if existing:
+            curr_txt = f"{data.get('demographic','')} {data.get('pain','')}"
+            old_txts = [f"{o['demographic']} {o['pain']}" for o in existing]
+            loop = asyncio.get_running_loop()
+            vecs = await loop.run_in_executor(None, embed.encode, old_txts + [curr_txt])
+            sims = np.dot(vecs[-1:], vecs[:-1].T)[0]
+            if np.max(sims) > 0.85:
+                logger.info(f"Duplicate skipped. Sim: {np.max(sims):.2f}")
+                return
+        oid = f"opp_{uuid.uuid4().hex[:8]}"
+        await insert_opp({
+            "id": oid, "demographic": data.get("demographic"), "pain": data.get("pain"),
+            "suggested_solution_direction": data.get("suggested_solution_direction"), 
+            "intensity_score": float(data.get("intensity_score", 0.5)), "sources": texts
+        })
+        logger.info(f"Saved {oid}")
+    async def scan_all_sources(self):
+        for q in self.search_queries: await self.scan_single(q)
+scanner = OpportunityScanner()
+"""),
+    ("app/core/team_builder.py", """\
+import numpy as np
+import asyncio
+from app.utils.db import get_all_agents, update_agent_health
+from app.utils.logger import logger
+from app/utils.vector_loader import get_embedding_model, unload_embedding
+class TeamBuilder:
+    async def match_team(self, demand: str, top_k=3):
+        embed = await get_embedding_model()
+        agents = await get_all_agents()
+        online_agents = [a for a in agents if a.get("health") == "online"]
+        if not online_agents:
+            return [{"agent_id":"default_coder","capabilities":["code_gen"],"reputation":0.9,"match_score":0.7}]
+        
+        loop = asyncio.get_running_loop()
+        caps = [",".join(a["capabilities"]) for a in online_agents]
+        cap_vecs = await loop.run_in_executor(None, embed.encode, caps)
+        req_vec = await loop.run_in_executor(None, embed.encode, [demand])
+        
+        sims = np.dot(req_vec, cap_vecs.T)[0]
+        # Weighting
+        if "code" in demand.lower():
+            for i, a in enumerate(online_agents):
+                if "code_gen" in a["capabilities"]: sims[i] *= 1.2
+                
+        idx_sort = np.argsort(sims)[::-1][:min(top_k, len(online_agents))]
+        result = [online_agents[i] for i in idx_sort]
+        for ag in result: await update_agent_health(ag["agent_id"], "online")
+        
+        asyncio.create_task(unload_embedding())
+        return result
+team_builder = TeamBuilder()
+"""),
+    ("app/core/factory.py", """\
+import uuid
+import tempfile
+import shutil
+import subprocess
+from pathlib import Path
+from app.utils.db import insert_product
+from app.llm.router import llm_router
+from app.utils.validator import check_python_code
+from app.utils.logger import logger
+from app.utils.crypto import get_secret
+class ProductFactory:
+    def __init__(self):
+        self.template_dir = Path(__file__).parent.parent.parent / "templates"
+    async def start_cleaner(self): pass 
+    async def _deploy_vercel(self, work_dir: Path) -> str:
+        token = get_secret("VERCEL_TOKEN")
+        if not token: return None
+        try:
+            res = subprocess.run(["vercel", "--prod", "--yes"], cwd=str(work_dir), capture_output=True, text=True, timeout=120)
+            return res.stdout 
+        except Exception: return None
+    async def build_deploy(self, opp: dict, team: list, template="telegram_bot") -> dict:
+        work_dir = Path(tempfile.mkdtemp(prefix="af_prod_"))
+        try:
+            src = self.template_dir / template
+            shutil.copytree(src, work_dir, dirs_exist_ok=True)
+            code_prompt = f"Generate {template} code for: {opp['pain']}"
+            raw = await llm_router.run("code_gen", code_prompt)
+            code = raw.text
+            if "```" in code:
+                code = code.split("```")[1].replace("python","").replace(template,"").strip()
+            
+            if not check_python_code(code):
+                with open(src / "app.py" if template=="web_app" else src / "bot.py", "r") as f: code = f.read()
+            file_name = "app.py" if template=="web_app" else "bot.py"
+            (work_dir / file_name).write_text(code.replace("{{PAIN}}", opp['pain']))
+            
+            url = await self._deploy_vercel(work_dir) or f"file://{work_dir}"
+            pid = f"prod_{uuid.uuid4().hex[:8]}"
+            await insert_product({"id": pid, "opportunity_id": opp["id"], "team": team, "url": url, "template": template})
+            return {"product_id": pid, "url": url}
+        except Exception as e:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise e
+factory = ProductFactory()
+"""),
+    ("app/core/funding.py", """\
+from app.llm.router import llm_router
+class FundingEngine:
+    async def generate_proposal(self, opp: dict, team: list) -> str:
+        return await llm_router.run("summary_trend", f"Pitch for {opp['pain']}").text
+funding = FundingEngine()
+"""),
+    ("app/core/operator.py", """\
+from app.utils.db import get_product_metrics
+from app.utils.logger import logger
+class OperationLoop:
+    async def monitor_product(self, pid: str):
+        m = await get_product_metrics(pid)
+        logger.info(f"Prod {pid}: {m['status']}")
+operator = OperationLoop()
+"""),
+    ("app/core/meaning.py", """\
+import numpy as np
+import asyncio
+from app.utils.logger import logger
+class MeaningOracle:
+    def __init__(self):
+        self.pos = {"great":0.9,"good":0.7}; self.neg = {"bad":-0.7}
+    async def compute(self, text: str) -> float:
+        s = 0.5
+        txt = text.lower()
+        for k,v in self.pos.items():
+            if k in txt: s += v*0.1
+        for k,v in self.neg.items():
+            if k in txt: s += v*0.1
+        return round(min(1.0, max(0.0, s)), 3)
+oracle = MeaningOracle()
+"""),
+    # Agents
+    ("app/agents/mesh_bus.py", """\
+import uuid
+import asyncio
+from typing import Dict, Any
+from app.utils.logger import logger
+class AgentMeshBus:
+    def __init__(self):
+        self.ws_conns: Dict[str, Any] = {}
+        self.task_queue = asyncio.Queue()
+        self._shutdown_event = asyncio.Event()
+    async def start(self): pass
+    async def register_ws(self, aid: str, ws): self.ws_conns[aid] = ws
+    async def unregister(self, aid: str): self.ws_conns.pop(aid, None)
+    async def shutdown(self): self._shutdown_event.set()
+mesh = AgentMeshBus()
+"""),
+    ("app/agents/registry.py", """\
+from app.utils.db import upsert_agent, get_all_agents
+class AgentRegistry:
+    async def register(self, data): await upsert_agent(data)
+    async def list_all(self): return await get_all_agents()
+registry = AgentRegistry()
+"""),
+    ("app/agents/health_monitor.py", """\
+import asyncio
+import time
+from app.utils.db import get_all_agents, update_agent_health
+from app.utils.logger import logger
+async def start_health_monitor():
+    while True:
+        await asyncio.sleep(300)
+        agents = await get_all_agents()
+        for a in agents:
+            if time.time() - a.get("last_ping", 0) > 600:
+                await update_agent_health(a["agent_id"], "offline")
+"""),
+    # LLM
+    ("app/llm/base_adapter.py", """\
+from pydantic import BaseModel
+class LLMResult(BaseModel):
+    text: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+class BaseAdapter:
+    async def chat(self, prompt: str, system: str, temp: float) -> LLMResult: raise NotImplementedError
+"""),
+    ("app/llm/router.py", """\
+from app.llm.providers.ollama import OllamaAdapter
+from app.llm.providers.claude import ClaudeAdapter
+from app.llm.providers.deepseek import DeepSeekAdapter
+from app.utils.crypto import get_secret
+from app.utils.logger import logger
+from app.utils.token_monitor import token_monitor
+from app.llm.base_adapter import LLMResult
+TASK_ROUTE_MAP = {
+    "demand_scan": ("claude", "claude-3-5-haiku-20241022"),
+    "code_gen": ("deepseek", "deepseek-coder"),
+    "summary_trend": ("deepseek", "deepseek-chat"),
+    "offline_default": ("ollama", "llama3.1:8b")
+}
+ENV_KEY_MAP = {"claude": "ANTHROPIC_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+class LLMRouter:
+    def __init__(self): self.cache = {}
+    def get_adapter(self, vendor: str, model: str):
+        if vendor in self.cache: return self.cache[vendor]
+        key = get_secret(ENV_KEY_MAP.get(vendor, ""))
+        if vendor != "ollama" and not key: raise ValueError(f"Missing key for {vendor}")
+        if vendor == "ollama": adp = OllamaAdapter(model)
+        elif vendor == "claude": adp = ClaudeAdapter(key, model)
+        elif vendor == "deepseek": adp = DeepSeekAdapter(key, model)
+        else: adp = None
+        if adp: self.cache[vendor] = adp
+        return adp
+    async def run(self, task_type: str, prompt: str, system: str = "", temp=0.3):
+        if token_monitor.is_cutoff(): return LLMResult(text="Token limit reached.")
+        vendor, model = TASK_ROUTE_MAP.get(task_type, TASK_ROUTE_MAP["offline_default"])
+        try:
+            adp = self.get_adapter(vendor, model)
+            res = await adp.chat(prompt, system, temp)
+            token_monitor.add_tokens(res.input_tokens, res.output_tokens)
+            return res
+        except Exception as e:
+            logger.warning(f"LLM fail, fallback Ollama: {e}")
+            try:
+                f = self.get_adapter("ollama", "llama3.1:8b")
+                return await f.chat(prompt, system, temp)
+            except Exception: return LLMResult(text="System unavailable")
+llm_router = LLMRouter()
+"""),
+    ("app/llm/providers/ollama.py", """\
+import os, httpx
+from app.llm.base_adapter import BaseAdapter, LLMResult
+class OllamaAdapter(BaseAdapter):
+    def __init__(self, model: str):
+        self.host = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+        self.model = model
+    async def chat(self, prompt: str, system: str, temp: float) -> LLMResult:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(f"{self.host}/api/generate", json={"model":self.model,"prompt":prompt,"system":system,"temperature":temp,"stream":False})
+            return LLMResult(text=r.json().get("response",""))
+"""),
+    ("app/llm/providers/claude.py", """\
+import httpx
+from app.llm.base_adapter import BaseAdapter, LLMResult
+class ClaudeAdapter(BaseAdapter):
+    def __init__(self, key: str, model: str):
+        self.headers = {"x-api-key":key,"anthropic-version":"2023-06-01","content-type":"application/json"}
+        self.model = model
+    async def chat(self, prompt: str, system: str, temp: float) -> LLMResult:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post("https://api.anthropic.com/v1/messages", headers=self.headers, json={"model":self.model,"system":system,"messages":[{"role":"user","content":prompt}],"temperature":temp,"max_tokens":2048})
+            return LLMResult(text=r.json()["content"][0]["text"])
+"""),
+    ("app/llm/providers/deepseek.py", """\
+import httpx
+from app.llm.base_adapter import BaseAdapter, LLMResult
+class DeepSeekAdapter(BaseAdapter):
+    def __init__(self, key: str, model: str):
+        self.headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        self.model = model
+    async def chat(self, prompt: str, system: str, temp: float) -> LLMResult:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post("https://api.deepseek.com/v1/chat/completions", headers=self.headers, json={"model":self.model,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":temp})
+            return LLMResult(text=r.json()["choices"][0]["message"]["content"])
+"""),
+    # Dashboard
+    ("dashboard/app.py", """\
+import gradio as gr
+from app.utils.db import list_opps
+from app.core.meaning import oracle
+from app.core.scanner import scanner
+from app.utils.crypto import get_secret, decrypt_env, encrypt_env
+async def scan_btn():
+    try:
+        await scanner.scan_all_sources()
+        return "Done"
+    except Exception as e: return f"Err: {e}"
+async def list_html():
+    opps = await list_opps(10)
+    h = "<h2>Opportunities</h2>"
+    for o in opps: h += f"<div><b>{o['id']}</b>: {o['pain']}</div>"
+    return h
+def save_keys(c, g, q):
+    env = decrypt_env()
+    if c: env["ANTHROPIC_API_KEY"] = c
+    if g: env["X_GROK_API_KEY"] = g
+    if q: env["DASHSCOPE_API_KEY"] = q
+    encrypt_env(env)
+    return "Saved"
+with gr.Blocks() as demo:
+    with gr.Tab("Ops"):
+        gr.Button("Scan").click(fn=scan_btn, outputs=gr.Textbox())
+        demo.load(fn=list_html, outputs=gr.HTML())
+    with gr.Tab("Config"):
+        gr.Textbox("Claude Key").save(save_keys)
+def mount_dashboard(app):
+    gr.mount_gradio_app(app, demo, path="/dashboard")
+"""),
+    # Scheduler
+    ("app/scheduler.py", """\
+import asyncio
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from app.core.scanner import scanner
+from app.core.team_builder import team_builder
+from app.core.funding import funding
+from app.core.factory import factory
+from app.core.operator import operator
+from app.utils.db import get_pending_opps, update_opp_status
+from app.utils.logger import logger
+class AutoEngine:
+    def __init__(self):
+        self.sched = AsyncIOScheduler()
+        self._cycle_lock = asyncio.Lock()
+    async def full_cycle(self):
+        async with self._cycle_lock:
+            await scanner.scan_all_sources()
+            for opp in await get_pending_opps(3):
+                try:
+                    await update_opp_status(opp["id"], "processing")
+                    team = await team_builder.match_team(opp.get("solution_dir",""))
+                    await funding.generate_proposal(opp, team)
+                    prod = await factory.build_deploy(opp, team)
+                    await operator.monitor_product(prod["product_id"])
+                    await update_opp_status(opp["id"], "deployed")
+                except Exception as e:
+                    logger.error(f"Err {opp['id']}: {e}")
+                    await update_opp_status(opp["id"], "error")
+    async def start(self, interval=30):
+        self.sched.add_job(self.full_cycle, "interval", minutes=interval, max_instances=1)
+        self.sched.start()
+        logger.info(f"Scheduler started, interval {interval}m")
+    async def shutdown(self):
+        if self.sched.running: self.sched.shutdown(wait=False)
+auto_engine = AutoEngine()
+"""),
+    # Templates
+    ("templates/telegram_bot/bot.py", """\
+import os
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TOKEN")
+async def start(update, ctx): await update.message.reply_text("Hello!")
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.run_polling()
+"""),
+    ("templates/telegram_bot/requirements.txt", """\
+python-telegram-bot==20.8
+"""),
+    ("templates/web_app/app.py", """\
+from flask import Flask
+app = Flask(__name__)
+@app.route('/')
+def home(): return "<h1>Pain: {{PAIN}}</h1>"
+if __name__ == '__main__': app.run(host="0.0.0.0", port=5000)
+"""),
+    ("templates/web_app/requirements.txt", """\
+flask==3.0.0
+"""),
+]
+def build_project():
+    if os.path.exists(PROJECT_NAME):
+        print(f"目录 {PROJECT_NAME} 已存在，正在删除...")
+        shutil.rmtree(PROJECT_NAME)
+    
+    os.makedirs(PROJECT_NAME)
+    os.chdir(PROJECT_NAME)
+    print(f"正在创建项目结构于: {os.getcwd()}")
+    for file_path, content in FILE_LIST:
+        dir_name = os.path.dirname(file_path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"已创建: {file_path}")
+    
+    init_files = [
+        "app/__init__.py", "app/api/__init__.py", "app/core/__init__.py", 
+        "app/agents/__init__.py", "app/llm/__init__.py", "app/utils/__init__.py",
+        "app/llm/providers/__init__.py", "dashboard/__init__.py"
+    ]
+    for f_path in init_files:
+        if not os.path.exists(f_path):
+            with open(f_path, 'w') as f: pass
+            print(f"已创建: {f_path}")
+    os.makedirs("scripts", exist_ok=True)
+    with open("scripts/install.sh", "w") as f:
+        f.write("#!/bin/bash\ndocker-compose up --build -d")
+    with open("scripts/install.bat", "w") as f:
+        f.write("@echo off\ndocker-compose up --build -d\npause")
+    with open("scripts/pull_models.sh", "w") as f:
+        f.write("#!/bin/bash\nollama pull llama3.1:8b") # Local Ollama direct pull
+        
+    print("\n✅ 项目构建完成！")
+    print(f"📂 项目位置: {os.path.dirname(os.getcwd())}/{PROJECT_NAME}")
+    print("🚀 请确保 Ollama 正在本地运行 (ollama serve)，然后执行:")
+    print("   cp .env.example .env")
+    print("   docker-compose up --build api")
+if __name__ == "__main__":
+    build_project()
