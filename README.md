@@ -54,7 +54,7 @@ Just run AgentFounder and watch your AI company come to life.
 
 ```bash
 # 1. Clone the project
-git clone https://github.com/yourname/AgentFounder.git
+git clone https://github.com/usaos/AgentFounder.git
 cd AgentFounder
 
 # 2. Configure environment (copy and fill in your API Keys)
@@ -206,7 +206,7 @@ This project is licensed under **AGPL-3.0**.
 
 - 🐦 Follow us on X  (coming soon)
 - 💬 Join our [Discord community] (coming soon)
-
+- 📧233961878@qq.com
 ---
 
 ## 🙏 Acknowledgments
